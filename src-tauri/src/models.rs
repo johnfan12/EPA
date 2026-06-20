@@ -20,6 +20,8 @@ pub struct CreateIdeaPayload {
     pub title: String,
     pub research_area: Option<String>,
     pub tags: Option<String>,
+    #[serde(default)]
+    pub brief: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +130,36 @@ pub struct UpdateReportPayload {
     pub id: i64,
     pub title: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct Conversation {
+    pub id: i64,
+    pub title: String,
+    /// JSON-encoded array of home chat messages (with previews / links).
+    pub messages: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Lightweight row for the conversation history list (no message payload).
+#[derive(Debug, Clone, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationMeta {
+    pub id: i64,
+    pub title: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveConversationPayload {
+    /// None → create a new conversation; Some(id) → update that conversation.
+    #[serde(default)]
+    pub id: Option<i64>,
+    pub title: String,
+    pub messages: String,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

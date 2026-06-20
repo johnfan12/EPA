@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentRun,
+  Conversation,
+  ConversationMeta,
   CreateAgentRunPayload,
   CreateEntryPayload,
   CreateExperimentPayload,
@@ -9,6 +11,8 @@ import type {
   GenerationResponse,
   Idea,
   IdeaEntry,
+  IdeaLink,
+  IdeaProposal,
   PromptResponse,
   ProviderSettings,
   Report,
@@ -50,6 +54,12 @@ export const api = {
 
   searchWorkspace: (query: string) => call<SearchHit[]>("search_workspace", { query }),
 
+  listConversations: () => call<ConversationMeta[]>("list_conversations"),
+  getConversation: (id: number) => call<Conversation>("get_conversation", { id }),
+  saveConversation: (payload: { id?: number | null; title: string; messages: string }) =>
+    call<Conversation>("save_conversation", { payload }),
+  deleteConversation: (id: number) => call<void>("delete_conversation", { id }),
+
   getProviderSettings: () => call<ProviderSettings>("get_provider_settings"),
   saveProviderSettings: (payload: ProviderSettings) =>
     call<ProviderSettings>("save_provider_settings", { payload }),
@@ -86,6 +96,18 @@ export const api = {
     messages: { role: "user" | "assistant"; content: string }[];
   }) =>
     call<{ content: string; actions: string[] }>("run_internal_agent", { request: payload }),
+
+  runHomeAgent: (payload: {
+    provider: string;
+    model: string;
+    apiKey?: string;
+    apiEndpoint?: string;
+    messages: { role: "user" | "assistant"; content: string }[];
+  }) =>
+    call<{ content: string; actions: string[]; proposals: IdeaProposal[]; links: IdeaLink[] }>(
+      "run_home_agent",
+      { request: payload },
+    ),
 
   runReportAgent: (payload: {
     ideaId: number;

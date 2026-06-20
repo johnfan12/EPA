@@ -7,7 +7,7 @@ use tauri::State;
 use crate::{
     db::AppState,
     llm::build_endpoint,
-    models::{AgentRun, Experiment, Idea, IdeaEntry, Report},
+    models::{AgentRun, Experiment, Idea, IdeaEntry, Report, SearchHit},
 };
 
 #[derive(Debug, Deserialize)]
@@ -610,6 +610,407 @@ pub async fn run_report_agent(
     run_agent_loop(
         &state.pool,
         request.idea_id,
+        api_key,
+        &request.model,
+        request.api_endpoint.as_deref(),
+        messages,
+    )
+    .await
+}
+
+// ----------------------------------------------------------------------------
+// Home (global) agent: reads across all ideas, can answer / find content,
+// propose new ideas (rendered as an editable preview in the UI) and emit
+// jump-to-idea buttons. Reuses validate_provider / chat_completion above.
+// ----------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeAgentRequest {
+    pub provider: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_endpoint: Option<String>,
+    pub messages: Vec<AgentChatMessage>,
+}
+
+/// A draft idea the agent suggests creating. Surfaced to the UI as an editable
+/// preview card; nothing is written to the DB until the user accepts.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdeaProposal {
+    pub title: String,
+    pub research_area: String,
+    pub tags: String,
+    pub brief: String,
+}
+
+/// A jump button pointing at an existing idea.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdeaLink {
+    pub idea_id: i64,
+    pub title: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeAgentResponse {
+    pub content: String,
+    pub actions: Vec<String>,
+    pub proposals: Vec<IdeaProposal>,
+    pub links: Vec<IdeaLink>,
+}
+
+/// Tool schemas for the global home agent (cross-idea, plus propose/link).
+fn home_tool_definitions() -> Value {
+    json!([
+        {"type": "function", "function": {
+            "name": "list_ideas",
+            "description": "列出工作台里所有 idea（返回 id、标题、研究方向、标签、brief 摘要、更新时间）。",
+            "parameters": {"type": "object", "properties": {}}
+        }},
+        {"type": "function", "function": {
+            "name": "read_idea",
+            "description": "读取某个 idea 的详情，以及它下面的讨论、实验、报告摘要。用于回答问题或定位内容。",
+            "parameters": {"type": "object", "properties": {"idea_id": {"type": "integer"}}, "required": ["idea_id"]}
+        }},
+        {"type": "function", "function": {
+            "name": "search_workspace",
+            "description": "跨所有 idea 全文检索讨论 / 实验 / 报告等内容，返回命中片段及其所属 ideaId。",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+        }},
+        {"type": "function", "function": {
+            "name": "propose_idea",
+            "description": "当用户描述了一个想新建的研究 idea 时调用：给出结构化草稿。不会直接创建，会作为可编辑预览展示给用户确认。brief 填入用户描述的 idea 详情。",
+            "parameters": {"type": "object", "properties": {
+                "title": {"type": "string"},
+                "research_area": {"type": "string"},
+                "tags": {"type": "string", "description": "逗号分隔的标签"},
+                "brief": {"type": "string", "description": "idea 详情 / 简介，可用 Markdown"}
+            }, "required": ["title", "brief"]}
+        }},
+        {"type": "function", "function": {
+            "name": "link_idea",
+            "description": "生成一个跳转到指定已存在 idea 的按钮（用于引用、给出答案出处、或建议用户打开）。",
+            "parameters": {"type": "object", "properties": {
+                "idea_id": {"type": "integer"},
+                "label": {"type": "string", "description": "按钮文案，可选，默认用 idea 标题"}
+            }, "required": ["idea_id"]}
+        }}
+    ])
+}
+
+/// Builds an FTS5 MATCH expression from free text (mirrors db::fts_query).
+fn home_fts_query(input: &str) -> Option<String> {
+    let terms = input
+        .split_whitespace()
+        .map(|term| {
+            term.chars()
+                .filter(|ch| ch.is_alphanumeric() || *ch == '_' || *ch as u32 > 0x7f)
+                .collect::<String>()
+        })
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("{term}*"))
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
+fn arg_i64(args: &Value, key: &str) -> Option<i64> {
+    let value = args.get(key)?;
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+}
+
+/// Dispatches one home-agent tool call. `propose_idea` / `link_idea` accumulate
+/// into the provided collectors instead of touching the database.
+async fn home_dispatch_tool(
+    pool: &SqlitePool,
+    name: &str,
+    args: &Value,
+    proposals: &mut Vec<IdeaProposal>,
+    links: &mut Vec<IdeaLink>,
+) -> Result<(Value, String), String> {
+    match name {
+        "list_ideas" => {
+            let rows = sqlx::query_as::<_, Idea>(
+                "SELECT * FROM ideas ORDER BY updated_at DESC LIMIT 100",
+            )
+            .fetch_all(pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let items = rows
+                .iter()
+                .map(|idea| {
+                    json!({
+                        "id": idea.id,
+                        "title": idea.title,
+                        "researchArea": idea.research_area,
+                        "tags": idea.tags,
+                        "brief": snippet(&idea.brief, 200),
+                        "updatedAt": idea.updated_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok((json!({ "items": items }), format!("读取了 {} 个 idea", rows.len())))
+        }
+        "read_idea" => {
+            let idea_id = arg_i64(args, "idea_id").ok_or("缺少有效的 idea_id")?;
+            let Some(idea) = sqlx::query_as::<_, Idea>("SELECT * FROM ideas WHERE id = ?")
+                .bind(idea_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|err| err.to_string())?
+            else {
+                return Ok((json!({ "error": "idea 不存在" }), format!("idea #{idea_id} 不存在")));
+            };
+
+            let discussions = sqlx::query_as::<_, IdeaEntry>(
+                "SELECT * FROM idea_entries WHERE idea_id = ? ORDER BY created_at DESC, id DESC LIMIT 20",
+            )
+            .bind(idea_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let experiments = sqlx::query_as::<_, Experiment>(
+                "SELECT * FROM experiments WHERE idea_id = ? ORDER BY created_at DESC, id DESC LIMIT 20",
+            )
+            .bind(idea_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let reports = sqlx::query_as::<_, Report>(
+                "SELECT * FROM reports WHERE idea_id = ? ORDER BY updated_at DESC, id DESC LIMIT 10",
+            )
+            .bind(idea_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|err| err.to_string())?;
+
+            let result = json!({
+                "id": idea.id,
+                "title": idea.title,
+                "researchArea": idea.research_area,
+                "status": idea.status,
+                "tags": idea.tags,
+                "brief": idea.brief,
+                "discussions": discussions.iter().map(|entry| json!({
+                    "id": entry.id,
+                    "kind": entry.kind,
+                    "title": entry.title,
+                    "summary": snippet(if entry.summary.is_empty() { &entry.content } else { &entry.summary }, 200),
+                })).collect::<Vec<_>>(),
+                "experiments": experiments.iter().map(|exp| json!({
+                    "id": exp.id,
+                    "name": exp.name,
+                    "metrics": exp.metrics_json,
+                    "summary": snippet(if !exp.conclusion.is_empty() { &exp.conclusion } else { &exp.raw_output }, 200),
+                })).collect::<Vec<_>>(),
+                "reports": reports.iter().map(|report| json!({
+                    "id": report.id,
+                    "title": report.title,
+                    "updatedAt": report.updated_at,
+                })).collect::<Vec<_>>(),
+            });
+            Ok((result, format!("读取了 idea「{}」", snippet(&idea.title, 24))))
+        }
+        "search_workspace" => {
+            let query = arg_str(args, "query");
+            let Some(match_query) = home_fts_query(&query) else {
+                return Ok((json!({ "items": [] }), "搜索词为空".to_string()));
+            };
+            let hits = sqlx::query_as::<_, SearchHit>(
+                "SELECT
+                   entity_type,
+                   entity_id,
+                   idea_id,
+                   title,
+                   snippet(search_index, 4, '', '', '...', 18) AS snippet
+                 FROM search_index
+                 WHERE search_index MATCH ?
+                 ORDER BY rank
+                 LIMIT 30",
+            )
+            .bind(match_query)
+            .fetch_all(pool)
+            .await
+            .map_err(|err| err.to_string())?;
+            let items = hits
+                .iter()
+                .map(|hit| {
+                    json!({
+                        "entityType": hit.entity_type,
+                        "entityId": hit.entity_id,
+                        "ideaId": hit.idea_id,
+                        "title": hit.title,
+                        "snippet": hit.snippet,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok((json!({ "items": items }), format!("搜索「{}」命中 {} 条", snippet(&query, 16), hits.len())))
+        }
+        "propose_idea" => {
+            let title = arg_str(args, "title");
+            if title.trim().is_empty() {
+                return Err("title 不能为空".to_string());
+            }
+            let log = format!("生成 idea 预览「{}」", snippet(&title, 24));
+            proposals.push(IdeaProposal {
+                title: title.trim().to_string(),
+                research_area: arg_str(args, "research_area").trim().to_string(),
+                tags: arg_str(args, "tags").trim().to_string(),
+                brief: arg_str(args, "brief").trim().to_string(),
+            });
+            Ok((
+                json!({ "ok": true, "note": "已在聊天中向用户展示可编辑预览，等待用户确认，请勿直接创建。" }),
+                log,
+            ))
+        }
+        "link_idea" => {
+            let idea_id = arg_i64(args, "idea_id").ok_or("缺少有效的 idea_id")?;
+            let Some(idea) = sqlx::query_as::<_, Idea>("SELECT * FROM ideas WHERE id = ?")
+                .bind(idea_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|err| err.to_string())?
+            else {
+                return Ok((json!({ "error": "idea 不存在" }), format!("idea #{idea_id} 不存在")));
+            };
+            let label = {
+                let value = arg_str(args, "label");
+                if value.trim().is_empty() { idea.title.clone() } else { value.trim().to_string() }
+            };
+            links.push(IdeaLink { idea_id: idea.id, title: label });
+            Ok((json!({ "ok": true }), format!("生成跳转按钮 →「{}」", snippet(&idea.title, 24))))
+        }
+        other => Err(format!("未知工具: {other}")),
+    }
+}
+
+/// Tool-calling loop for the home agent; collects proposals/links alongside the
+/// final answer.
+async fn run_home_loop(
+    pool: &SqlitePool,
+    api_key: &str,
+    model: &str,
+    api_endpoint: Option<&str>,
+    mut messages: Vec<Value>,
+) -> Result<HomeAgentResponse, String> {
+    let tools = home_tool_definitions();
+    let mut actions: Vec<String> = Vec::new();
+    let mut proposals: Vec<IdeaProposal> = Vec::new();
+    let mut links: Vec<IdeaLink> = Vec::new();
+
+    for _ in 0..MAX_TOOL_ROUNDS {
+        let value =
+            chat_completion(api_key, model, api_endpoint, &json!(messages), &tools).await?;
+        let message = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .cloned()
+            .ok_or_else(|| "LLM 响应缺少 message".to_string())?;
+
+        let tool_calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        if tool_calls.is_empty() {
+            let content = message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            return Ok(HomeAgentResponse { content, actions, proposals, links });
+        }
+
+        messages.push(message.clone());
+
+        for call in &tool_calls {
+            let call_id = call.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let function = call.get("function");
+            let name = function
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let args = function
+                .and_then(|f| f.get("arguments"))
+                .map(|value| match value {
+                    Value::String(raw) => serde_json::from_str::<Value>(raw).unwrap_or(json!({})),
+                    other => other.clone(),
+                })
+                .unwrap_or(json!({}));
+
+            let (result, log) =
+                match home_dispatch_tool(pool, &name, &args, &mut proposals, &mut links).await {
+                    Ok(pair) => pair,
+                    Err(err) => (json!({ "error": err }), format!("工具 {name} 失败：{err}")),
+                };
+            actions.push(log);
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": result.to_string()
+            }));
+        }
+    }
+
+    Ok(HomeAgentResponse {
+        content: "已达到本轮工具调用上限，请把任务拆得更小一些再试。".to_string(),
+        actions,
+        proposals,
+        links,
+    })
+}
+
+#[tauri::command]
+pub async fn run_home_agent(
+    state: State<'_, AppState>,
+    request: HomeAgentRequest,
+) -> Result<HomeAgentResponse, String> {
+    let api_key = match validate_provider(request.api_key.as_deref(), &request.provider) {
+        Ok(key) => key,
+        Err(early) => {
+            return Ok(HomeAgentResponse {
+                content: early.content,
+                actions: early.actions,
+                proposals: Vec::new(),
+                links: Vec::new(),
+            })
+        }
+    };
+
+    let system = "你是科研工作台主页的全局助手。\
+         你可以使用工具读取用户的所有 idea 来回答问题、查找内容：list_ideas 列出全部 idea，\
+         read_idea 读取某个 idea 的详情与其讨论 / 实验 / 报告，search_workspace 跨 idea 全文检索。\
+         当用户描述了一个想要新建的研究 idea 时，不要直接创建，而是调用 propose_idea 给出结构化草稿\
+         （title、research_area、tags，brief 填入用户描述的 idea 详情）；草稿会作为可编辑预览展示给用户，\
+         由用户确认后才真正创建。\
+         当你需要指向某个已存在的 idea（引用、给出答案出处、建议用户打开）时，调用 link_idea 生成跳转按钮。\
+         回答用中文，简洁清楚。"
+        .to_string();
+
+    let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": system })];
+    for message in &request.messages {
+        let role = match message.role.as_str() {
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        messages.push(json!({ "role": role, "content": message.content }));
+    }
+
+    run_home_loop(
+        &state.pool,
         api_key,
         &request.model,
         request.api_endpoint.as_deref(),

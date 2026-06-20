@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { api } from "./api";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { EmptyState } from "./components/EmptyState";
+import { HomeView } from "./components/HomeView";
 import { useIdeaChildren } from "./hooks/useIdeaChildren";
 import { DiscussionTab } from "./tabs/DiscussionTab";
 import { AgentTab } from "./tabs/AgentTab";
@@ -31,6 +32,8 @@ export default function App() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const theme = useWorkspaceStore((state) => state.theme);
   const toggleTheme = useWorkspaceStore((state) => state.toggleTheme);
+  const view = useWorkspaceStore((state) => state.view);
+  const setView = useWorkspaceStore((state) => state.setView);
   const selectedIdeaId = useWorkspaceStore((state) => state.selectedIdeaId);
   const setSelectedIdeaId = useWorkspaceStore((state) => state.setSelectedIdeaId);
   const activeTab = useWorkspaceStore((state) => state.activeTab);
@@ -94,25 +97,33 @@ export default function App() {
     mutationFn: api.deleteIdea,
     onSuccess: async () => {
       setSelectedIdeaId(null);
+      setView("home");
       await queryClient.invalidateQueries({ queryKey: ["ideas"] });
       setNotice("Idea 已归档删除。");
     },
   });
 
+  // Selecting an idea (sidebar, search hit, home agent button) enters its workspace.
+  const openIdea = (id: number) => {
+    setSelectedIdeaId(id);
+    setView("workspace");
+  };
+
   return (
-    <main className="app-shell">
+    <main className={view === "home" ? "app-shell home" : "app-shell"}>
       <Sidebar
         ideas={ideas}
-        selectedIdeaId={selectedIdea?.id ?? null}
+        selectedIdeaId={view === "workspace" ? selectedIdea?.id ?? null : null}
+        homeActive={view === "home"}
         search={search}
         setSearch={setSearch}
-        onSelect={setSelectedIdeaId}
-        onCreated={(idea) => {
-          setSelectedIdeaId(idea.id);
-          queryClient.invalidateQueries({ queryKey: ["ideas"] });
-        }}
+        onSelect={openIdea}
+        onGoHome={() => setView("home")}
       />
 
+      {view === "home" ? (
+        <HomeView providerSettings={providerSettings} apiKey={apiKey} onOpenIdea={openIdea} />
+      ) : (
       <section className="workspace">
         <header className="topbar">
           <div>
@@ -177,8 +188,9 @@ export default function App() {
           />
         )}
       </section>
+      )}
 
-      <RightRail idea={selectedIdea} {...children} />
+      {view === "workspace" ? <RightRail idea={selectedIdea} {...children} /> : null}
 
       {settingsOpen ? (
         <SettingsDialog
