@@ -8,9 +8,10 @@ use sqlx::{
 use tauri::{AppHandle, Manager, State};
 
 use crate::models::{
-    AgentRun, CreateAgentRunPayload, CreateEntryPayload, CreateExperimentPayload,
-    CreateIdeaPayload, Experiment, Idea, IdeaEntry, ProviderSettings, Report,
-    SaveProviderSettingsPayload, SearchHit, UpdateIdeaPayload, UpdateReportPayload,
+    AgentRun, Conversation, ConversationMeta, CreateAgentRunPayload, CreateEntryPayload,
+    CreateExperimentPayload, CreateIdeaPayload, Experiment, Idea, IdeaEntry, ProviderSettings,
+    Report, SaveConversationPayload, SaveProviderSettingsPayload, SearchHit, UpdateIdeaPayload,
+    UpdateReportPayload,
 };
 use crate::prompt;
 
@@ -147,12 +148,13 @@ pub async fn create_idea(
     }
 
     let id = sqlx::query(
-        "INSERT INTO ideas(title, research_area, tags)
-         VALUES (?, ?, ?)",
+        "INSERT INTO ideas(title, research_area, tags, brief)
+         VALUES (?, ?, ?, ?)",
     )
     .bind(title)
     .bind(clean_optional(payload.research_area))
     .bind(clean_optional(payload.tags))
+    .bind(clean_optional(payload.brief))
     .execute(&state.pool)
     .await
     .map_err(|err| err.to_string())?
@@ -456,6 +458,76 @@ pub async fn search_workspace(
     .fetch_all(&state.pool)
     .await
     .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn list_conversations(
+    state: State<'_, AppState>,
+) -> Result<Vec<ConversationMeta>, String> {
+    sqlx::query_as::<_, ConversationMeta>(
+        "SELECT id, title, updated_at FROM conversations ORDER BY updated_at DESC, id DESC",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn get_conversation(state: State<'_, AppState>, id: i64) -> Result<Conversation, String> {
+    sqlx::query_as::<_, Conversation>("SELECT * FROM conversations WHERE id = ?")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+/// Creates (id = None) or updates (id = Some) a conversation, returning the row.
+#[tauri::command]
+pub async fn save_conversation(
+    state: State<'_, AppState>,
+    payload: SaveConversationPayload,
+) -> Result<Conversation, String> {
+    let title = {
+        let trimmed = payload.title.trim();
+        if trimmed.is_empty() { "新对话".to_string() } else { trimmed.to_string() }
+    };
+    let messages = if payload.messages.trim().is_empty() {
+        "[]".to_string()
+    } else {
+        payload.messages
+    };
+
+    let id = match payload.id {
+        Some(id) => {
+            sqlx::query("UPDATE conversations SET title = ?, messages = ? WHERE id = ?")
+                .bind(&title)
+                .bind(&messages)
+                .bind(id)
+                .execute(&state.pool)
+                .await
+                .map_err(|err| err.to_string())?;
+            id
+        }
+        None => sqlx::query("INSERT INTO conversations(title, messages) VALUES (?, ?)")
+            .bind(&title)
+            .bind(&messages)
+            .execute(&state.pool)
+            .await
+            .map_err(|err| err.to_string())?
+            .last_insert_rowid(),
+    };
+
+    get_conversation(state, id).await
+}
+
+#[tauri::command]
+pub async fn delete_conversation(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    sqlx::query("DELETE FROM conversations WHERE id = ?")
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]

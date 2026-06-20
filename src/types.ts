@@ -84,6 +84,37 @@ export interface CreateIdeaPayload {
   title: string;
   researchArea?: string;
   tags?: string;
+  brief?: string;
+}
+
+/** A draft idea proposed by the home agent, shown as an editable preview. */
+export interface IdeaProposal {
+  title: string;
+  researchArea: string;
+  tags: string;
+  brief: string;
+}
+
+/** A jump button to an existing idea, emitted by the home agent. */
+export interface IdeaLink {
+  ideaId: number;
+  title: string;
+}
+
+/** A persisted home-agent conversation (messages stored as a JSON string). */
+export interface Conversation {
+  id: number;
+  title: string;
+  messages: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Lightweight conversation row for the history list. */
+export interface ConversationMeta {
+  id: number;
+  title: string;
+  updatedAt: string;
 }
 
 export interface CreateEntryPayload {

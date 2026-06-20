@@ -1338,3 +1338,339 @@ tbody tr:hover {
     transform: none;
   }
 }
+
+/* ---------- Home page (Claude-style global chat) ---------- */
+.app-shell.home {
+  grid-template-columns: 292px minmax(0, 1fr);
+}
+
+.new-idea-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 44px;
+  margin-bottom: 14px;
+  border-radius: 8px;
+  border: 1px solid hsl(var(--primary));
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.new-idea-button:hover {
+  background: hsl(var(--primary-hover));
+  border-color: hsl(var(--primary-hover));
+}
+
+.new-idea-button.active {
+  box-shadow: 0 0 0 2px hsl(var(--primary) / 0.3);
+}
+
+.home-view {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+  background: hsl(var(--background));
+}
+
+.home-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 24px;
+  border-bottom: 1px solid hsl(var(--border));
+  background: hsl(var(--panel));
+}
+
+.home-header-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: hsl(var(--muted-foreground));
+}
+
+.home-scroll {
+  flex: 1;
+  overflow: auto;
+}
+
+.home-inner {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 28px 24px;
+}
+
+.home-greeting {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12vh;
+  text-align: center;
+}
+
+.home-greeting h1 {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.home-greeting p {
+  max-width: 520px;
+  margin: 0;
+}
+
+.home-warning {
+  color: hsl(var(--destructive));
+  font-size: 13px;
+}
+
+.home-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 520px;
+  margin-top: 8px;
+}
+
+.home-suggestion {
+  text-align: left;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--panel));
+  font-size: 13px;
+  color: hsl(var(--foreground));
+}
+
+.home-suggestion:hover {
+  background: hsl(var(--muted));
+  border-color: hsl(var(--border-strong));
+}
+
+.home-thread {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+}
+
+.home-thread .chat-message.assistant {
+  max-width: 100%;
+  background: transparent;
+  padding: 4px 0;
+  border-radius: 0;
+}
+
+.home-composer {
+  border-top: 1px solid hsl(var(--border));
+  background: hsl(var(--panel));
+  padding: 14px 24px;
+}
+
+.home-composer-inner {
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+/* ---------- Editable idea preview & jump buttons ---------- */
+.idea-preview-card {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+  border: 1px solid hsl(var(--primary) / 0.3);
+  border-left: 3px solid hsl(var(--primary));
+  border-radius: 8px;
+  background: hsl(var(--info-soft));
+  padding: 14px;
+  box-shadow: var(--shadow-sm);
+}
+
+.idea-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.idea-preview-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: hsl(var(--primary));
+}
+
+.idea-preview-field {
+  display: grid;
+  gap: 4px;
+}
+
+.idea-preview-field > span {
+  font-size: 12px;
+  font-weight: 600;
+  color: hsl(var(--muted-foreground));
+}
+
+.idea-preview-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.idea-preview-field textarea {
+  min-height: 96px;
+}
+
+.idea-preview-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+.idea-preview-error {
+  color: hsl(var(--destructive));
+  font-size: 12px;
+}
+
+.idea-link-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.idea-link-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid hsl(var(--border-strong));
+  background: hsl(var(--panel));
+  font-size: 12px;
+  font-weight: 600;
+  color: hsl(var(--foreground));
+}
+
+.idea-link-button:hover {
+  background: hsl(var(--muted));
+  border-color: hsl(var(--primary));
+  color: hsl(var(--primary));
+}
+
+/* ---------- Home conversation history dropdown ---------- */
+.home-header .icon-button.subtle.active {
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+}
+
+.home-history {
+  position: relative;
+  display: inline-flex;
+}
+
+.home-history-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+}
+
+.home-history-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 30;
+  width: 280px;
+  max-height: 60vh;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+  background: hsl(var(--panel));
+  box-shadow: var(--shadow-md, 0 10px 30px hsl(0 0% 0% / 0.18));
+}
+
+.home-history-head {
+  padding: 6px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: hsl(var(--muted-foreground));
+}
+
+.home-history-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.home-history-item:hover {
+  background: hsl(var(--muted));
+}
+
+.home-history-item.active {
+  background: hsl(var(--info-soft));
+}
+
+.home-history-item-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.home-history-item-text span {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-history-item-text small {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.home-history-delete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+}
+
+.home-history-delete:hover {
+  background: hsl(var(--destructive) / 0.12);
+  color: hsl(var(--destructive));
+}
+
+.home-history-empty {
+  padding: 14px 8px;
+  text-align: center;
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
