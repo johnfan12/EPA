@@ -2,15 +2,15 @@ import { Code, Eye, FileText, Sparkles, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
-import { ChatBox } from "../components/ChatBox";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { MarkdownEditor } from "../components/MarkdownEditor";
 import { MarkdownWysiwyg } from "../components/MarkdownWysiwyg";
 import { TimelineEmpty } from "../components/EmptyState";
 import { useIdeaDraft } from "../hooks/useIdeaDraft";
-import { formatDate, stripCodeFence, uid } from "../lib/format";
+import { beginRun, endRun, runKey, useAgentRun } from "../lib/agentRun";
+import { formatDate, stripCodeFence } from "../lib/format";
+import { useWorkspaceStore } from "../store";
 import type { TabProps } from "../lib/types";
-import type { ChatMessage } from "../store";
 import type { Report } from "../types";
 
 type Mode = "wysiwyg" | "source";
@@ -23,6 +23,10 @@ export function ReportsTab({ idea, providerSettings, apiKey, setNotice }: TabPro
   const [editVersion, setEditVersion] = useState(0);
   const [confirmDel, setConfirmDel] = useState(false);
 
+  const agentFocus = useWorkspaceStore((state) => state.agentFocus);
+  const focus = agentFocus?.target === "report" ? agentFocus : null;
+  const glowing = focus?.op === "read" || focus?.op === "update";
+
   const reportsQuery = useQuery({
     queryKey: ["reports", idea.id],
     queryFn: () => api.listReports(idea.id),
@@ -31,10 +35,30 @@ export function ReportsTab({ idea, providerSettings, apiKey, setNotice }: TabPro
   const selectedReport =
     reports.find((report) => report.id === draft.reportSelectedId) ?? reports[0];
 
-  // Seed the edit buffer from the DB whenever the selected report changes.
-  useEffect(() => {
+  // Seed the edit buffer from the DB the moment the selected report changes
+  // (during render so the WYSIWYG mounts with content on its first render).
+  const [seededReportId, setSeededReportId] = useState<number | undefined>(undefined);
+  if (selectedReport?.id !== seededReportId) {
+    setSeededReportId(selectedReport?.id);
     setContent(selectedReport?.content ?? "");
-  }, [selectedReport?.id]);
+  }
+
+  // When the left agent creates / edits a report, open it and re-seed the editor
+  // from the DB so the change shows up live. Keyed on the focus nonce so it only
+  // fires on a fresh agent action, not on our own autosave round-trips.
+  useEffect(() => {
+    if (!focus || (focus.op !== "create" && focus.op !== "update") || focus.id == null) return;
+    if (draft.reportSelectedId !== focus.id) {
+      patch({ reportSelectedId: focus.id });
+      return;
+    }
+    const fresh = reports.find((report) => report.id === focus.id);
+    if (fresh && fresh.content !== content) {
+      setContent(fresh.content);
+      setEditVersion((version) => version + 1);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus?.nonce, reportsQuery.dataUpdatedAt]);
 
   const autosave = useMutation({
     mutationFn: (vars: { id: number; title: string; content: string }) => api.updateReport(vars),
@@ -51,30 +75,38 @@ export function ReportsTab({ idea, providerSettings, apiKey, setNotice }: TabPro
     return () => window.clearTimeout(timeout);
   }, [content, selectedReport?.id]);
 
-  const generate = useMutation({
-    mutationFn: async () => {
-      const result = await api.runReportAgent({
-        ideaId: idea.id,
-        provider: providerSettings.provider,
-        model: providerSettings.model,
-        apiKey,
-        apiEndpoint: providerSettings.apiEndpoint,
-      });
-      if (!result.content.trim()) {
-        throw new Error("Agent 未返回报告内容（请确认已配置 OpenAI 兼容的 API key）。");
+  // Generate run state lives in the store so it survives tab switches.
+  const genKey = runKey.reportGen(idea.id);
+  const genRun = useAgentRun(genKey);
+
+  const runGenerate = () => {
+    if (genRun.running) return;
+    beginRun(genKey);
+    (async () => {
+      try {
+        const result = await api.runReportAgent({
+          ideaId: idea.id,
+          provider: providerSettings.provider,
+          model: providerSettings.model,
+          apiKey,
+          apiEndpoint: providerSettings.apiEndpoint,
+        });
+        if (!result.content.trim()) {
+          throw new Error("Agent 未返回报告内容（请确认已配置 OpenAI 兼容的 API key）。");
+        }
+        const created = await api.generateReport(idea.id);
+        const title = `${idea.title} - AI 报告 ${new Date().toLocaleDateString()}`;
+        await api.updateReport({ id: created.id, title, content: stripCodeFence(result.content) });
+        patch({ reportSelectedId: created.id });
+        await queryClient.invalidateQueries({ queryKey: ["reports", idea.id] });
+        setNotice("AI 已生成新报告。");
+      } catch (error) {
+        setNotice(String(error));
+      } finally {
+        endRun(genKey);
       }
-      const created = await api.generateReport(idea.id);
-      const title = `${idea.title} - AI 报告 ${new Date().toLocaleDateString()}`;
-      await api.updateReport({ id: created.id, title, content: stripCodeFence(result.content) });
-      return created.id;
-    },
-    onSuccess: async (reportId) => {
-      patch({ reportSelectedId: reportId });
-      await queryClient.invalidateQueries({ queryKey: ["reports", idea.id] });
-      setNotice("AI 已生成新报告。");
-    },
-    onError: (error) => setNotice(String(error)),
-  });
+    })();
+  };
 
   const deleteReport = useMutation({
     mutationFn: (reportId: number) => api.deleteReport(reportId),
@@ -86,75 +118,30 @@ export function ReportsTab({ idea, providerSettings, apiKey, setNotice }: TabPro
     onError: (error) => setNotice(String(error)),
   });
 
-  // Chat that asks the agent to rewrite the current report.
-  const edit = useMutation({
-    mutationFn: (vars: { instruction: string; messages: ChatMessage[] }) =>
-      api.runReportEditAgent({
-        ideaId: idea.id,
-        provider: providerSettings.provider,
-        model: providerSettings.model,
-        apiKey,
-        apiEndpoint: providerSettings.apiEndpoint,
-        content,
-        instruction: vars.instruction,
-      }),
-    onSuccess: async (result, vars) => {
-      const ok = result.content.trim().length > 0;
-      patch({
-        reportChatMessages: [
-          ...vars.messages,
-          {
-            id: uid(),
-            role: "assistant",
-            content: ok ? "已根据指令更新报告。" : "未能生成修改后的报告。",
-            actions: result.actions,
-          },
-        ],
-      });
-      if (ok && selectedReport) {
-        const next = stripCodeFence(result.content);
-        await api.updateReport({
-          id: selectedReport.id,
-          title: selectedReport.title,
-          content: next,
-        });
-        setContent(next);
-        setEditVersion((version) => version + 1);
-        await queryClient.invalidateQueries({ queryKey: ["reports", idea.id] });
-      }
-    },
-    onError: (error) => setNotice(String(error)),
-  });
-
-  const sendReportEdit = () => {
-    const text = draft.reportChatInput.trim();
-    if (!text || edit.isPending || !apiKey || !selectedReport) return;
-    const messages = [...draft.reportChatMessages, { id: uid(), role: "user" as const, content: text }];
-    patch({ reportChatMessages: messages, reportChatInput: "" });
-    edit.mutate({ instruction: text, messages });
-  };
-
   const editorKey = selectedReport ? `${selectedReport.id}-${editVersion}` : "none";
 
   return (
     <section className="tab-panel report-layout">
       <div className="report-actions">
-        <button className="primary-button" onClick={() => generate.mutate()} disabled={generate.isPending}>
+        <button className="primary-button" onClick={runGenerate} disabled={genRun.running}>
           <Sparkles size={16} />
-          <span>{generate.isPending ? "AI 生成中…" : "生成报告"}</span>
+          <span>{genRun.running ? "AI 生成中…" : "生成报告"}</span>
         </button>
         <span className="muted-text">
-          AI 会读取本 idea 的讨论 / 实验 / 沟通记录，并参考上一份报告，生成一份新报告，之后可直接修改或让下方 Agent 改。
+          AI 会读取本 idea 的讨论 / 实验记录，并参考上一份报告，生成一份新报告，之后可直接修改或让左侧 Agent 改。
         </span>
       </div>
 
-      <div className="report-view">
+      <div className={glowing ? "report-view is-reading" : "report-view"} key={glowing ? `read-${focus.nonce}` : "report-view"}>
         <aside className="report-list">
           {reports.length ? (
             reports.map((report: Report) => (
               <button
                 key={report.id}
-                className={report.id === selectedReport?.id ? "idea-item active" : "idea-item"}
+                className={
+                  (report.id === selectedReport?.id ? "idea-item active" : "idea-item") +
+                  (focus?.op === "create" && focus.id === report.id ? " is-new" : "")
+                }
                 onClick={() => patch({ reportSelectedId: report.id })}
               >
                 <span>{report.title}</span>
@@ -205,25 +192,12 @@ export function ReportsTab({ idea, providerSettings, apiKey, setNotice }: TabPro
                 </div>
               </div>
             </div>
-
-            <ChatBox
-              title="让 Agent 改报告"
-              hint={apiKey ? "描述要怎么改，Agent 会改写当前报告" : "配置 API key 后可用"}
-              emptyHint="例如“把第 2 节写详细些”“补上最新实验结果”“整体更简洁”。Agent 会读取记录并重写当前报告。"
-              placeholder="描述修改要求，Enter 发送，Shift+Enter 换行"
-              messages={draft.reportChatMessages}
-              input={draft.reportChatInput}
-              onInputChange={(value) => patch({ reportChatInput: value })}
-              onSend={sendReportEdit}
-              sending={edit.isPending}
-              disabled={!apiKey}
-            />
           </div>
         ) : (
           <div className="report-editor-pane empty">
             <TimelineEmpty
               icon={<FileText size={22} />}
-              message="还没有报告。点上方“生成报告”，AI 会综合现有进度写出一份，再在这里直接修改。"
+              message="还没有报告。点上方“生成报告”，或让左侧 Agent 综合现有进度写一份，再在这里直接修改。"
             />
           </div>
         )}

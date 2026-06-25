@@ -1,14 +1,49 @@
+use std::collections::BTreeMap;
+
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::{
     db::AppState,
     llm::build_endpoint,
-    models::{AgentRun, Experiment, Idea, IdeaEntry, Report, SearchHit},
+    models::{Experiment, Idea, IdeaEntry, Report, SearchHit},
 };
+
+/// Emits streamed agent events to the frontend over the Tauri event system on a
+/// per-run event name. Used instead of `ipc::Channel` because the event system
+/// reliably delivers messages incrementally while the command is still running.
+pub struct StreamEmitter {
+    app: AppHandle,
+    event: String,
+}
+
+impl StreamEmitter {
+    fn send(&self, event: StreamEvent) {
+        let _ = self.app.emit(&self.event, event);
+    }
+}
+
+/// Incremental updates streamed to the UI while an agent runs. The final
+/// structured result is still returned as the command's resolved value.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum StreamEvent {
+    /// A chunk of assistant text (final answer being generated).
+    Delta { text: String },
+    /// A tool action the agent just performed. `op`/`target`/`id` let the UI jump
+    /// the right pane to the affected section and animate it. `target` is one of
+    /// "discussion" | "experiment" | "report" (or "" when not navigable);
+    /// `op` is "read" | "create" | "delete"; `id` is set for create.
+    Action {
+        text: String,
+        op: String,
+        target: String,
+        id: Option<i64>,
+    },
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,11 +65,31 @@ pub struct InternalAgentRequest {
     pub messages: Vec<AgentChatMessage>,
 }
 
+/// One ordered piece of a finished assistant turn — answer text or an inline
+/// tool record (with navigation metadata). Returned alongside the streamed
+/// events so the UI can render tools inline and replay right-pane animations
+/// even when live deltas didn't arrive (e.g. a non-streaming provider).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ResponseSegment {
+    Text {
+        text: String,
+    },
+    Action {
+        text: String,
+        op: String,
+        target: String,
+        id: Option<i64>,
+    },
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InternalAgentResponse {
     pub content: String,
     pub actions: Vec<String>,
+    #[serde(default)]
+    pub segments: Vec<ResponseSegment>,
 }
 
 const MAX_TOOL_ROUNDS: usize = 8;
@@ -62,26 +117,6 @@ fn tool_definitions() -> Value {
         {"type": "function", "function": {
             "name": "delete_discussion",
             "description": "按 id 删除一条讨论记录。",
-            "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}
-        }},
-        {"type": "function", "function": {
-            "name": "list_agent_runs",
-            "description": "列出当前 idea 下最近的 Agent 沟通记录（返回 id、状态、prompt/输出摘要）。",
-            "parameters": {"type": "object", "properties": {}}
-        }},
-        {"type": "function", "function": {
-            "name": "create_agent_run",
-            "description": "在当前 idea 下新建一条 Agent 沟通记录。",
-            "parameters": {"type": "object", "properties": {
-                "prompt": {"type": "string"},
-                "output": {"type": "string"},
-                "summary": {"type": "string"},
-                "status": {"type": "string", "description": "prompted | completed，默认 recorded"}
-            }, "required": ["prompt"]}
-        }},
-        {"type": "function", "function": {
-            "name": "delete_agent_run",
-            "description": "按 id 删除一条 Agent 沟通记录。",
             "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}
         }},
         {"type": "function", "function": {
@@ -114,11 +149,25 @@ fn tool_definitions() -> Value {
         }},
         {"type": "function", "function": {
             "name": "create_report",
-            "description": "在当前 idea 下新建一份报告。先用 list_discussions / list_experiments / list_agent_runs 读取材料，再据此写出完整的中文 Markdown 报告内容。",
+            "description": "在当前 idea 下新建一份报告。先用 list_discussions / list_experiments 读取材料，再据此写出完整的中文 Markdown 报告内容。",
             "parameters": {"type": "object", "properties": {
                 "title": {"type": "string"},
                 "content": {"type": "string", "description": "完整的 Markdown 报告正文"}
             }, "required": ["title", "content"]}
+        }},
+        {"type": "function", "function": {
+            "name": "read_report",
+            "description": "按 id 读取一份报告的完整正文（用于在修改前获取当前内容）。",
+            "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}
+        }},
+        {"type": "function", "function": {
+            "name": "update_report",
+            "description": "按 id 修改一份已存在的报告。用户要求改报告时：先 list_reports 找到目标（通常是最新的一份），用 read_report 读取，再用本工具写回修改后的完整 Markdown 正文；未被要求改动的部分尽量保持不变。",
+            "parameters": {"type": "object", "properties": {
+                "id": {"type": "integer"},
+                "title": {"type": "string", "description": "可选，不传则保留原标题"},
+                "content": {"type": "string", "description": "修改后的完整 Markdown 报告正文"}
+            }, "required": ["id", "content"]}
         }}
     ])
 }
@@ -145,6 +194,26 @@ fn arg_id(args: &Value) -> Option<i64> {
     value
         .as_i64()
         .or_else(|| value.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+}
+
+/// Maps an internal tool call + its result to UI-navigation metadata so the
+/// frontend can jump the right pane to the affected section and animate it.
+/// Returns (op, target, id); empty target means "not navigable".
+fn action_meta(name: &str, result: &Value) -> (String, String, Option<i64>) {
+    let id = result.get("id").and_then(Value::as_i64);
+    let (op, target): (&str, &str) = match name {
+        "list_discussions" => ("read", "discussion"),
+        "create_discussion" => ("create", "discussion"),
+        "delete_discussion" => ("delete", "discussion"),
+        "list_experiments" => ("read", "experiment"),
+        "create_experiment" => ("create", "experiment"),
+        "delete_experiment" => ("delete", "experiment"),
+        "list_reports" | "read_report" => ("read", "report"),
+        "create_report" => ("create", "report"),
+        "update_report" => ("update", "report"),
+        _ => ("", ""),
+    };
+    (op.to_string(), target.to_string(), id)
 }
 
 /// Runs one tool call against the database. Returns (json_result, action_log).
@@ -215,61 +284,6 @@ async fn dispatch_tool(
                 .map_err(|err| err.to_string())?
                 .rows_affected();
             Ok((json!({ "deleted": affected }), format!("删除讨论记录 #{id}")))
-        }
-        "list_agent_runs" => {
-            let rows = sqlx::query_as::<_, AgentRun>(
-                "SELECT * FROM agent_runs WHERE idea_id = ? ORDER BY created_at DESC, id DESC LIMIT 30",
-            )
-            .bind(idea_id)
-            .fetch_all(pool)
-            .await
-            .map_err(|err| err.to_string())?;
-            let items = rows
-                .iter()
-                .map(|run| {
-                    json!({
-                        "id": run.id,
-                        "status": run.status,
-                        "summary": snippet(if !run.summary.is_empty() { &run.summary } else if !run.output.is_empty() { &run.output } else { &run.prompt }, 200),
-                    })
-                })
-                .collect::<Vec<_>>();
-            Ok((json!({ "items": items }), format!("读取了 {} 条 Agent 沟通记录", rows.len())))
-        }
-        "create_agent_run" => {
-            let prompt = arg_str(args, "prompt");
-            if prompt.trim().is_empty() {
-                return Err("prompt 不能为空".to_string());
-            }
-            let status = {
-                let value = arg_str(args, "status");
-                if value.trim().is_empty() { "recorded".to_string() } else { value }
-            };
-            let id = sqlx::query(
-                "INSERT INTO agent_runs(idea_id, target_agent, task_type, prompt, output, summary, status)
-                 VALUES (?, '', '', ?, ?, ?, ?)",
-            )
-            .bind(idea_id)
-            .bind(prompt.trim())
-            .bind(arg_str(args, "output").trim())
-            .bind(arg_str(args, "summary").trim())
-            .bind(status.trim())
-            .execute(pool)
-            .await
-            .map_err(|err| err.to_string())?
-            .last_insert_rowid();
-            Ok((json!({ "id": id, "ok": true }), "新建 Agent 沟通记录".to_string()))
-        }
-        "delete_agent_run" => {
-            let id = arg_id(args).ok_or("缺少有效的 id")?;
-            let affected = sqlx::query("DELETE FROM agent_runs WHERE id = ? AND idea_id = ?")
-                .bind(id)
-                .bind(idea_id)
-                .execute(pool)
-                .await
-                .map_err(|err| err.to_string())?
-                .rows_affected();
-            Ok((json!({ "deleted": affected }), format!("删除 Agent 沟通记录 #{id}")))
         }
         "list_experiments" => {
             let rows = sqlx::query_as::<_, Experiment>(
@@ -366,6 +380,53 @@ async fn dispatch_tool(
                 .last_insert_rowid();
             Ok((json!({ "id": id, "ok": true }), format!("新建报告「{}」", snippet(&title, 24))))
         }
+        "read_report" => {
+            let id = arg_id(args).ok_or("缺少有效的 id")?;
+            let Some(report) =
+                sqlx::query_as::<_, Report>("SELECT * FROM reports WHERE id = ? AND idea_id = ?")
+                    .bind(id)
+                    .bind(idea_id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|err| err.to_string())?
+            else {
+                return Ok((json!({ "error": "报告不存在" }), format!("报告 #{id} 不存在")));
+            };
+            Ok((
+                json!({ "id": report.id, "title": report.title, "content": report.content }),
+                format!("读取报告「{}」", snippet(&report.title, 24)),
+            ))
+        }
+        "update_report" => {
+            let id = arg_id(args).ok_or("缺少有效的 id")?;
+            let content = arg_str(args, "content");
+            if content.trim().is_empty() {
+                return Err("content 不能为空".to_string());
+            }
+            let Some(report) =
+                sqlx::query_as::<_, Report>("SELECT * FROM reports WHERE id = ? AND idea_id = ?")
+                    .bind(id)
+                    .bind(idea_id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|err| err.to_string())?
+            else {
+                return Ok((json!({ "error": "报告不存在" }), format!("报告 #{id} 不存在")));
+            };
+            let title = {
+                let value = arg_str(args, "title");
+                if value.trim().is_empty() { report.title.clone() } else { value.trim().to_string() }
+            };
+            sqlx::query("UPDATE reports SET title = ?, content = ? WHERE id = ? AND idea_id = ?")
+                .bind(title.trim())
+                .bind(content.trim())
+                .bind(id)
+                .bind(idea_id)
+                .execute(pool)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok((json!({ "id": id, "ok": true }), format!("更新报告「{}」", snippet(&title, 24))))
+        }
         other => Err(format!("未知工具: {other}")),
     }
 }
@@ -400,6 +461,132 @@ async fn chat_completion(
     serde_json::from_str::<Value>(&text).map_err(|err| format!("Invalid JSON response: {err}"))
 }
 
+/// Streaming counterpart of `chat_completion`. Sends `stream: true`, parses the
+/// SSE deltas, forwards assistant-text chunks to the emitter as they arrive, and
+/// returns the fully-assembled assistant message (content + tool_calls) so the
+/// caller's tool loop is unchanged.
+async fn stream_chat(
+    api_key: &str,
+    model: &str,
+    api_endpoint: Option<&str>,
+    messages: &Value,
+    tools: &Value,
+    emitter: &StreamEmitter,
+) -> Result<Value, String> {
+    let endpoint = build_endpoint(api_endpoint, "https://api.openai.com/v1", "/chat/completions");
+    let client = reqwest::Client::new();
+    let mut response = client
+        .post(endpoint)
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "stream": true
+        }))
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let status: StatusCode = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("LLM provider returned {status}: {text}"));
+    }
+
+    // Byte buffer (not String): chunk boundaries can split a multi-byte UTF-8
+    // char, so we only decode once a full newline-delimited line is assembled.
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut content_acc = String::new();
+    // index -> (id, name, arguments) accumulated across deltas.
+    let mut tool_acc: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
+    let mut done = false;
+
+    while let Some(bytes) = response.chunk().await.map_err(|err| err.to_string())? {
+        buffer.extend_from_slice(&bytes);
+        // SSE frames are newline-delimited; process every complete line.
+        while let Some(pos) = buffer.iter().position(|&byte| byte == b'\n') {
+            let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                done = true;
+                break;
+            }
+            let Ok(chunk_json) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            let Some(delta) = chunk_json
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("delta"))
+            else {
+                continue;
+            };
+
+            if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    content_acc.push_str(text);
+                    emitter.send(StreamEvent::Delta { text: text.to_string() });
+                }
+            }
+
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in tool_calls {
+                    let index = call.get("index").and_then(Value::as_i64).unwrap_or(0);
+                    let entry = tool_acc.entry(index).or_default();
+                    if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        if !id.is_empty() {
+                            entry.0 = id.to_string();
+                        }
+                    }
+                    if let Some(function) = call.get("function") {
+                        if let Some(name) = function.get("name").and_then(Value::as_str) {
+                            if !name.is_empty() {
+                                entry.1.push_str(name);
+                            }
+                        }
+                        if let Some(args) = function.get("arguments").and_then(Value::as_str) {
+                            entry.2.push_str(args);
+                        }
+                    }
+                }
+            }
+        }
+        if done {
+            break;
+        }
+    }
+
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_string(), json!("assistant"));
+    if tool_acc.is_empty() {
+        message.insert("content".to_string(), json!(content_acc));
+    } else {
+        message.insert("content".to_string(), Value::Null);
+        let tool_calls: Vec<Value> = tool_acc
+            .into_iter()
+            .map(|(_, (id, name, args))| {
+                json!({
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args }
+                })
+            })
+            .collect();
+        message.insert("tool_calls".to_string(), json!(tool_calls));
+    }
+    Ok(Value::Object(message))
+}
+
 /// Validates the api key + provider, returning the trimmed key or an early
 /// (non-error) response to hand straight back to the UI.
 fn validate_provider<'a>(
@@ -410,6 +597,7 @@ fn validate_provider<'a>(
         return Err(InternalAgentResponse {
             content: "请先在设置里配置 API key，Agent 才能工作。".to_string(),
             actions: Vec::new(),
+            segments: Vec::new(),
         });
     };
     if provider.to_lowercase() != "openai" {
@@ -418,6 +606,7 @@ fn validate_provider<'a>(
                 "Agent 目前需要 OpenAI 兼容接口（chat/completions + function calling）。请在设置里将 provider 切换为 OpenAI，或填入兼容的自定义 Endpoint。"
                     .to_string(),
             actions: Vec::new(),
+            segments: Vec::new(),
         });
     }
     Ok(key)
@@ -432,20 +621,14 @@ async fn run_agent_loop(
     model: &str,
     api_endpoint: Option<&str>,
     mut messages: Vec<Value>,
+    emitter: Option<&StreamEmitter>,
 ) -> Result<InternalAgentResponse, String> {
     let tools = tool_definitions();
     let mut actions: Vec<String> = Vec::new();
+    let mut segments: Vec<ResponseSegment> = Vec::new();
 
     for _ in 0..MAX_TOOL_ROUNDS {
-        let value =
-            chat_completion(api_key, model, api_endpoint, &json!(messages), &tools).await?;
-        let message = value
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .cloned()
-            .ok_or_else(|| "LLM 响应缺少 message".to_string())?;
+        let message = next_message(api_key, model, api_endpoint, &messages, &tools, emitter).await?;
 
         let tool_calls = message
             .get("tool_calls")
@@ -459,7 +642,10 @@ async fn run_agent_loop(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            return Ok(InternalAgentResponse { content, actions });
+            if !content.trim().is_empty() {
+                segments.push(ResponseSegment::Text { text: content.clone() });
+            }
+            return Ok(InternalAgentResponse { content, actions, segments });
         }
 
         // The assistant turn that issued the tool calls must be replayed verbatim.
@@ -485,6 +671,16 @@ async fn run_agent_loop(
                 Ok(pair) => pair,
                 Err(err) => (json!({ "error": err }), format!("工具 {name} 失败：{err}")),
             };
+            let (op, target, id) = action_meta(&name, &result);
+            if let Some(em) = emitter {
+                em.send(StreamEvent::Action {
+                    text: log.clone(),
+                    op: op.clone(),
+                    target: target.clone(),
+                    id,
+                });
+            }
+            segments.push(ResponseSegment::Action { text: log.clone(), op, target, id });
             actions.push(log);
             messages.push(json!({
                 "role": "tool",
@@ -494,16 +690,45 @@ async fn run_agent_loop(
         }
     }
 
+    let content = "已达到本轮工具调用上限，请把任务拆得更小一些再试。".to_string();
+    segments.push(ResponseSegment::Text { text: content.clone() });
     Ok(InternalAgentResponse {
-        content: "已达到本轮工具调用上限，请把任务拆得更小一些再试。".to_string(),
+        content,
         actions,
+        segments,
     })
 }
 
-#[tauri::command]
-pub async fn run_internal_agent(
-    state: State<'_, AppState>,
+/// One model round: streams via `stream_chat` when a channel is present,
+/// otherwise a single blocking `chat_completion`. Returns the assistant message.
+async fn next_message(
+    api_key: &str,
+    model: &str,
+    api_endpoint: Option<&str>,
+    messages: &[Value],
+    tools: &Value,
+    emitter: Option<&StreamEmitter>,
+) -> Result<Value, String> {
+    match emitter {
+        Some(em) => stream_chat(api_key, model, api_endpoint, &json!(messages), tools, em).await,
+        None => {
+            let value =
+                chat_completion(api_key, model, api_endpoint, &json!(messages), tools).await?;
+            value
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("message"))
+                .cloned()
+                .ok_or_else(|| "LLM 响应缺少 message".to_string())
+        }
+    }
+}
+
+async fn run_internal_agent_inner(
+    state: &AppState,
     request: InternalAgentRequest,
+    emitter: Option<&StreamEmitter>,
 ) -> Result<InternalAgentResponse, String> {
     let api_key = match validate_provider(request.api_key.as_deref(), &request.provider) {
         Ok(key) => key,
@@ -518,11 +743,14 @@ pub async fn run_internal_agent(
 
     let system = format!(
         "你是科研工作台的内部 Agent，当前正在处理 idea「{}」(id={})。\
-         你可以使用提供的工具读取 / 新建 / 删除该 idea 下的讨论记录、Agent 沟通记录、实验记录，读取报告，并新建报告。\
-         如果用户要你写 / 生成报告，请先用 list_discussions、list_experiments、list_agent_runs 读取材料，\
+         你可以使用提供的工具读取 / 新建 / 删除该 idea 下的讨论记录、实验记录，以及读取 / 新建 / 修改报告。\
+         如果用户要你写 / 生成报告，请先用 list_discussions、list_experiments 读取材料，\
          再调用 create_report 写入一份完整的中文 Markdown 报告（标题简洁、正文覆盖研究问题、进展、方法、结果、分析、下一步）。\
+         如果用户要你修改报告，请先 list_reports 找到目标（通常是最新一份），用 read_report 读取现有正文，\
+         再调用 update_report 写回修改后的完整正文，未被要求改动的部分尽量保持不变。\
          请根据用户请求规划并调用工具完成任务：删除或修改前如不确定，先用 list_* 工具读取确认。\
-         所有工具都只作用于当前这个 idea。完成后用中文简要说明你做了什么。",
+         所有工具都只作用于当前这个 idea，你的每次工具调用都会实时反映在用户界面右侧。\
+         完成后用中文简要说明你做了什么。",
         idea.title, idea.id
     );
 
@@ -542,8 +770,28 @@ pub async fn run_internal_agent(
         &request.model,
         request.api_endpoint.as_deref(),
         messages,
+        emitter,
     )
     .await
+}
+
+#[tauri::command]
+pub async fn run_internal_agent(
+    state: State<'_, AppState>,
+    request: InternalAgentRequest,
+) -> Result<InternalAgentResponse, String> {
+    run_internal_agent_inner(state.inner(), request, None).await
+}
+
+#[tauri::command]
+pub async fn run_internal_agent_stream(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: InternalAgentRequest,
+    stream_id: String,
+) -> Result<InternalAgentResponse, String> {
+    let emitter = StreamEmitter { app, event: format!("agent-stream:{stream_id}") };
+    run_internal_agent_inner(state.inner(), request, Some(&emitter)).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -614,6 +862,7 @@ pub async fn run_report_agent(
         &request.model,
         request.api_endpoint.as_deref(),
         messages,
+        None,
     )
     .await
 }
@@ -659,6 +908,7 @@ pub struct IdeaLink {
 pub struct HomeAgentResponse {
     pub content: String,
     pub actions: Vec<String>,
+    pub segments: Vec<ResponseSegment>,
     pub proposals: Vec<IdeaProposal>,
     pub links: Vec<IdeaLink>,
 }
@@ -901,22 +1151,16 @@ async fn run_home_loop(
     model: &str,
     api_endpoint: Option<&str>,
     mut messages: Vec<Value>,
+    emitter: Option<&StreamEmitter>,
 ) -> Result<HomeAgentResponse, String> {
     let tools = home_tool_definitions();
     let mut actions: Vec<String> = Vec::new();
+    let mut segments: Vec<ResponseSegment> = Vec::new();
     let mut proposals: Vec<IdeaProposal> = Vec::new();
     let mut links: Vec<IdeaLink> = Vec::new();
 
     for _ in 0..MAX_TOOL_ROUNDS {
-        let value =
-            chat_completion(api_key, model, api_endpoint, &json!(messages), &tools).await?;
-        let message = value
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .cloned()
-            .ok_or_else(|| "LLM 响应缺少 message".to_string())?;
+        let message = next_message(api_key, model, api_endpoint, &messages, &tools, emitter).await?;
 
         let tool_calls = message
             .get("tool_calls")
@@ -930,7 +1174,10 @@ async fn run_home_loop(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            return Ok(HomeAgentResponse { content, actions, proposals, links });
+            if !content.trim().is_empty() {
+                segments.push(ResponseSegment::Text { text: content.clone() });
+            }
+            return Ok(HomeAgentResponse { content, actions, segments, proposals, links });
         }
 
         messages.push(message.clone());
@@ -956,6 +1203,20 @@ async fn run_home_loop(
                     Ok(pair) => pair,
                     Err(err) => (json!({ "error": err }), format!("工具 {name} 失败：{err}")),
                 };
+            if let Some(em) = emitter {
+                em.send(StreamEvent::Action {
+                    text: log.clone(),
+                    op: String::new(),
+                    target: String::new(),
+                    id: None,
+                });
+            }
+            segments.push(ResponseSegment::Action {
+                text: log.clone(),
+                op: String::new(),
+                target: String::new(),
+                id: None,
+            });
             actions.push(log);
             messages.push(json!({
                 "role": "tool",
@@ -965,18 +1226,21 @@ async fn run_home_loop(
         }
     }
 
+    let content = "已达到本轮工具调用上限，请把任务拆得更小一些再试。".to_string();
+    segments.push(ResponseSegment::Text { text: content.clone() });
     Ok(HomeAgentResponse {
-        content: "已达到本轮工具调用上限，请把任务拆得更小一些再试。".to_string(),
+        content,
         actions,
+        segments,
         proposals,
         links,
     })
 }
 
-#[tauri::command]
-pub async fn run_home_agent(
-    state: State<'_, AppState>,
+async fn run_home_agent_inner(
+    state: &AppState,
     request: HomeAgentRequest,
+    emitter: Option<&StreamEmitter>,
 ) -> Result<HomeAgentResponse, String> {
     let api_key = match validate_provider(request.api_key.as_deref(), &request.provider) {
         Ok(key) => key,
@@ -984,6 +1248,7 @@ pub async fn run_home_agent(
             return Ok(HomeAgentResponse {
                 content: early.content,
                 actions: early.actions,
+                segments: early.segments,
                 proposals: Vec::new(),
                 links: Vec::new(),
             })
@@ -1015,8 +1280,28 @@ pub async fn run_home_agent(
         &request.model,
         request.api_endpoint.as_deref(),
         messages,
+        emitter,
     )
     .await
+}
+
+#[tauri::command]
+pub async fn run_home_agent(
+    state: State<'_, AppState>,
+    request: HomeAgentRequest,
+) -> Result<HomeAgentResponse, String> {
+    run_home_agent_inner(state.inner(), request, None).await
+}
+
+#[tauri::command]
+pub async fn run_home_agent_stream(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: HomeAgentRequest,
+    stream_id: String,
+) -> Result<HomeAgentResponse, String> {
+    let emitter = StreamEmitter { app, event: format!("agent-stream:{stream_id}") };
+    run_home_agent_inner(state.inner(), request, Some(&emitter)).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -1073,6 +1358,7 @@ pub async fn run_report_edit_agent(
         &request.model,
         request.api_endpoint.as_deref(),
         messages,
+        None,
     )
     .await
 }

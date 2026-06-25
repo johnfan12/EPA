@@ -1,13 +1,13 @@
-import { Beaker, Bot, FileText, MessageSquareText, Moon, Settings, Sun, Trash2 } from "lucide-react";
+import { Beaker, FileText, MessageSquareText, Moon, Settings, Sun, Trash2 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { api } from "./api";
+import { AgentWorkspace } from "./components/AgentWorkspace";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { EmptyState } from "./components/EmptyState";
 import { HomeView } from "./components/HomeView";
 import { useIdeaChildren } from "./hooks/useIdeaChildren";
 import { DiscussionTab } from "./tabs/DiscussionTab";
-import { AgentTab } from "./tabs/AgentTab";
 import { ExperimentsTab } from "./tabs/ExperimentsTab";
 import { ReportsTab } from "./tabs/ReportsTab";
 import { Sidebar } from "./panels/Sidebar";
@@ -18,7 +18,6 @@ import type { TabProps } from "./lib/types";
 
 const tabs = [
   { id: "discussion", label: "讨论与演化", icon: MessageSquareText },
-  { id: "agents", label: "Agent 沟通", icon: Bot },
   { id: "experiments", label: "实验数据", icon: Beaker },
   { id: "reports", label: "实验报告", icon: FileText },
 ] as const;
@@ -42,6 +41,10 @@ export default function App() {
   const setSettingsOpen = useWorkspaceStore((state) => state.setSettingsOpen);
   const apiKeyByProvider = useWorkspaceStore((state) => state.apiKeyByProvider);
   const setApiKey = useWorkspaceStore((state) => state.setApiKey);
+  const agentFocus = useWorkspaceStore((state) => state.agentFocus);
+  const setAgentFocus = useWorkspaceStore((state) => state.setAgentFocus);
+  const agentWidth = useWorkspaceStore((state) => state.agentWidth);
+  const setAgentWidth = useWorkspaceStore((state) => state.setAgentWidth);
 
   const ideasQuery = useQuery({
     queryKey: ["ideas", search],
@@ -76,6 +79,14 @@ export default function App() {
     window.localStorage.setItem("theme", theme);
   }, [theme]);
 
+  // Clear the agent's right-pane focus shortly after it fires so the glow /
+  // slide-in animations are one-shot and don't linger.
+  useEffect(() => {
+    if (!agentFocus) return;
+    const timeout = window.setTimeout(() => setAgentFocus(null), 2600);
+    return () => window.clearTimeout(timeout);
+  }, [agentFocus?.nonce, setAgentFocus]);
+
   // Load the saved API key for the active provider from the OS credential store.
   const provider = providerSettings.provider;
   const hasKey = Boolean(apiKeyByProvider[provider]);
@@ -103,10 +114,33 @@ export default function App() {
     },
   });
 
+  // Persist the dragged Agent column width.
+  useEffect(() => {
+    window.localStorage.setItem("agentWidth", String(agentWidth));
+  }, [agentWidth]);
+
   // Selecting an idea (sidebar, search hit, home agent button) enters its workspace.
   const openIdea = (id: number) => {
     setSelectedIdeaId(id);
     setView("workspace");
+  };
+
+  // Drag the splitter between the Agent column and the data pane.
+  const startResize = (event: React.PointerEvent) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = agentWidth;
+    const onMove = (move: PointerEvent) => setAgentWidth(startWidth + (move.clientX - startX));
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+    };
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   };
 
   return (
@@ -124,6 +158,25 @@ export default function App() {
       {view === "home" ? (
         <HomeView providerSettings={providerSettings} apiKey={apiKey} onOpenIdea={openIdea} />
       ) : (
+      <div className="workspace-split">
+      {selectedIdea ? (
+        <AgentWorkspace
+          idea={selectedIdea}
+          providerSettings={providerSettings}
+          apiKey={apiKey}
+          setNotice={setNotice}
+          width={agentWidth}
+        />
+      ) : (
+        <aside className="agent-workspace" style={{ width: agentWidth, flex: "none" }} />
+      )}
+      <div
+        className="col-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        title="拖动调整宽度"
+        onPointerDown={startResize}
+      />
       <section className="workspace">
         <header className="topbar">
           <div>
@@ -188,6 +241,7 @@ export default function App() {
           />
         )}
       </section>
+      </div>
       )}
 
       {view === "workspace" ? <RightRail idea={selectedIdea} {...children} /> : null}
@@ -224,7 +278,6 @@ export default function App() {
 
 function IdeaTab({ tab, ...props }: TabProps & { tab: TabId }) {
   if (tab === "discussion") return <DiscussionTab {...props} />;
-  if (tab === "agents") return <AgentTab {...props} />;
   if (tab === "experiments") return <ExperimentsTab {...props} />;
   return <ReportsTab {...props} />;
 }

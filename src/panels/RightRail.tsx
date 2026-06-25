@@ -1,17 +1,15 @@
 import { MarkdownPreview } from "../components/MarkdownPreview";
 import { splitTags } from "../lib/format";
-import type { AgentRun, Experiment, Idea, IdeaEntry, Report } from "../types";
+import type { Experiment, Idea, IdeaEntry, Report } from "../types";
 
 export function RightRail({
   idea,
   entries,
-  agentRuns,
   experiments,
   reports,
 }: {
   idea: Idea | null;
   entries: IdeaEntry[];
-  agentRuns: AgentRun[];
   experiments: Experiment[];
   reports: Report[];
 }) {
@@ -23,6 +21,11 @@ export function RightRail({
       </aside>
     );
   }
+
+  const recent = experiments
+    .map((experiment) => experiment.conclusion || experiment.rawOutput)
+    .filter((text) => text.trim().length > 0)
+    .slice(0, 3);
 
   return (
     <aside className="right-rail">
@@ -43,18 +46,17 @@ export function RightRail({
 
       <section className="stats-grid">
         <div><strong>{entries.length}</strong><span>讨论</span></div>
-        <div><strong>{agentRuns.length}</strong><span>Agent</span></div>
         <div><strong>{experiments.length}</strong><span>实验</span></div>
         <div><strong>{reports.length}</strong><span>报告</span></div>
       </section>
 
       <section>
-        <h3>最近结论</h3>
+        <h3>最近实验结论</h3>
         <ul className="compact-list">
-          {agentRuns.slice(0, 3).map((run) => (
-            <li key={run.id}>{run.summary || run.output || run.prompt.slice(0, 120)}</li>
+          {recent.map((text, index) => (
+            <li key={index}>{text.slice(0, 120)}</li>
           ))}
-          {!agentRuns.length ? <li>暂无 Agent 结论。</li> : null}
+          {!recent.length ? <li>暂无实验结论。</li> : null}
         </ul>
       </section>
     </aside>

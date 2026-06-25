@@ -137,8 +137,10 @@ pub struct UpdateReportPayload {
 pub struct Conversation {
     pub id: i64,
     pub title: String,
-    /// JSON-encoded array of home chat messages (with previews / links).
+    /// JSON-encoded array of chat messages (with previews / links / segments).
     pub messages: String,
+    /// Owning idea; NULL for the global home-page conversation.
+    pub idea_id: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -158,6 +160,9 @@ pub struct SaveConversationPayload {
     /// None → create a new conversation; Some(id) → update that conversation.
     #[serde(default)]
     pub id: Option<i64>,
+    /// Owning idea; None → the global home-page conversation.
+    #[serde(default)]
+    pub idea_id: Option<i64>,
     pub title: String,
     pub messages: String,
 }

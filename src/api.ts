@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   AgentRun,
   Conversation,
@@ -20,6 +21,48 @@ import type {
 } from "./types";
 
 const call = <T>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
+
+/** Navigation metadata attached to a tool action. */
+export type AgentActionMeta = {
+  op: "read" | "create" | "delete" | "update";
+  target: string;
+  id: number | null;
+};
+
+/** Incremental events streamed from a running agent. Action events carry
+ * navigation metadata so the UI can jump/animate the right pane. */
+export type AgentStreamEvent =
+  | { type: "delta"; text: string }
+  | ({ type: "action"; text: string } & AgentActionMeta);
+
+/** One ordered piece of a finished assistant turn (answer text or tool record),
+ * returned with the final result so the UI can render tools inline and replay
+ * right-pane animations even when live deltas didn't arrive. */
+export type AgentResponseSegment =
+  | { type: "text"; text: string }
+  | ({ type: "action"; text: string } & AgentActionMeta);
+
+/** Invoke a streaming command: subscribes to a per-run Tauri event for live
+ * incremental events, then resolves with the final structured result. The
+ * event system (rather than ipc::Channel) reliably delivers events while the
+ * command is still running. */
+const callStream = async <T>(
+  command: string,
+  request: Record<string, unknown>,
+  onEvent: (event: AgentStreamEvent) => void,
+): Promise<T> => {
+  const streamId =
+    globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  // Register the listener before invoking so no early events are missed.
+  const unlisten = await listen<AgentStreamEvent>(`agent-stream:${streamId}`, (event) =>
+    onEvent(event.payload),
+  );
+  try {
+    return await invoke<T>(command, { request, streamId });
+  } finally {
+    unlisten();
+  }
+};
 
 export const api = {
   listIdeas: (query?: string) => call<Idea[]>("list_ideas", { query }),
@@ -54,10 +97,15 @@ export const api = {
 
   searchWorkspace: (query: string) => call<SearchHit[]>("search_workspace", { query }),
 
-  listConversations: () => call<ConversationMeta[]>("list_conversations"),
+  listConversations: (ideaId?: number | null) =>
+    call<ConversationMeta[]>("list_conversations", { ideaId: ideaId ?? null }),
   getConversation: (id: number) => call<Conversation>("get_conversation", { id }),
-  saveConversation: (payload: { id?: number | null; title: string; messages: string }) =>
-    call<Conversation>("save_conversation", { payload }),
+  saveConversation: (payload: {
+    id?: number | null;
+    ideaId?: number | null;
+    title: string;
+    messages: string;
+  }) => call<Conversation>("save_conversation", { payload }),
   deleteConversation: (id: number) => call<void>("delete_conversation", { id }),
 
   getProviderSettings: () => call<ProviderSettings>("get_provider_settings"),
@@ -66,14 +114,6 @@ export const api = {
 
   composeSummaryPrompt: (ideaId: number) =>
     call<PromptResponse>("compose_summary_prompt", { payload: { ideaId } }),
-  composeAgentPrompt: (ideaId: number, userGoal: string) =>
-    call<PromptResponse>("compose_agent_prompt", {
-      payload: { ideaId, userGoal },
-    }),
-  composeExperimentPrompt: (ideaId: number, userGoal: string, rawOutput: string) =>
-    call<PromptResponse>("compose_experiment_prompt", {
-      payload: { ideaId, userGoal, rawOutput },
-    }),
   composeReportPrompt: (ideaId: number) =>
     call<PromptResponse>("compose_report_prompt", { payload: { ideaId } }),
 
@@ -97,6 +137,23 @@ export const api = {
   }) =>
     call<{ content: string; actions: string[] }>("run_internal_agent", { request: payload }),
 
+  runInternalAgentStream: (
+    payload: {
+      ideaId: number;
+      provider: string;
+      model: string;
+      apiKey?: string;
+      apiEndpoint?: string;
+      messages: { role: "user" | "assistant"; content: string }[];
+    },
+    onEvent: (event: AgentStreamEvent) => void,
+  ) =>
+    callStream<{ content: string; actions: string[]; segments: AgentResponseSegment[] }>(
+      "run_internal_agent_stream",
+      payload,
+      onEvent,
+    ),
+
   runHomeAgent: (payload: {
     provider: string;
     model: string;
@@ -108,6 +165,24 @@ export const api = {
       "run_home_agent",
       { request: payload },
     ),
+
+  runHomeAgentStream: (
+    payload: {
+      provider: string;
+      model: string;
+      apiKey?: string;
+      apiEndpoint?: string;
+      messages: { role: "user" | "assistant"; content: string }[];
+    },
+    onEvent: (event: AgentStreamEvent) => void,
+  ) =>
+    callStream<{
+      content: string;
+      actions: string[];
+      segments: AgentResponseSegment[];
+      proposals: IdeaProposal[];
+      links: IdeaLink[];
+    }>("run_home_agent_stream", payload, onEvent),
 
   runReportAgent: (payload: {
     ideaId: number;

@@ -11,10 +11,21 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import type { KeyboardEvent } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
 import { MarkdownPreview } from "./MarkdownPreview";
+import { AgentSegments } from "./AgentSegments";
 import { IdeaPreviewCard } from "./IdeaPreviewCard";
+import {
+  appendAction,
+  appendDelta,
+  beginRun,
+  endRun,
+  runKey,
+  snapshotRun,
+  toChatSegments,
+  useAgentRun,
+} from "../lib/agentRun";
 import { deriveTitle, formatDate, uid } from "../lib/format";
 import { useWorkspaceStore } from "../store";
 import type { HomeChatMessage } from "../store";
@@ -59,8 +70,8 @@ export function HomeView({
   const [historyOpen, setHistoryOpen] = useState(false);
 
   const conversations = useQuery({
-    queryKey: ["conversations"],
-    queryFn: api.listConversations,
+    queryKey: ["conversations", "home"],
+    queryFn: () => api.listConversations(),
   });
 
   // Persist the conversation after each turn. Reads the live id from the store
@@ -75,56 +86,66 @@ export function HomeView({
       })
       .then((conv) => {
         if (id == null) setConversationId(conv.id);
-        queryClient.invalidateQueries({ queryKey: ["conversations"] });
+        queryClient.invalidateQueries({ queryKey: ["conversations", "home"] });
       })
       .catch(() => undefined);
   };
 
-  const agent = useMutation({
-    mutationFn: (next: HomeChatMessage[]) =>
-      api.runHomeAgent({
-        provider: providerSettings.provider,
-        model: providerSettings.model,
-        apiKey,
-        apiEndpoint: providerSettings.apiEndpoint,
-        messages: next.map((message) => ({ role: message.role, content: message.content })),
-      }),
-    onSuccess: (result, next) => {
-      const final: HomeChatMessage[] = [
-        ...next,
-        {
-          id: uid(),
-          role: "assistant",
-          content: result.content || "（无输出）",
-          actions: result.actions,
-          proposals: result.proposals,
-          links: result.links,
-        },
-      ];
-      setMessages(final);
-      persist(final);
-      // The agent may have read/affected ideas — keep the sidebar list fresh.
-      if (result.actions.length) {
-        queryClient.invalidateQueries({ queryKey: ["ideas"] });
-      }
-    },
-    onError: (error, next) => {
-      const final: HomeChatMessage[] = [
-        ...next,
-        { id: uid(), role: "assistant", content: `出错了：${String(error)}` },
-      ];
-      setMessages(final);
-      persist(final);
-    },
-  });
+  const run = useAgentRun(runKey.home);
 
   const send = (text: string) => {
     const value = text.trim();
-    if (!value || agent.isPending || !apiKey) return;
+    if (!value || run.running || !apiKey) return;
     const next: HomeChatMessage[] = [...messages, { id: uid(), role: "user", content: value }];
     setMessages(next);
     setInput("");
-    agent.mutate(next);
+    beginRun(runKey.home);
+    api
+      .runHomeAgentStream(
+        {
+          provider: providerSettings.provider,
+          model: providerSettings.model,
+          apiKey,
+          apiEndpoint: providerSettings.apiEndpoint,
+          messages: next.map((message) => ({ role: message.role, content: message.content })),
+        },
+        (event) => {
+          if (event.type === "delta") appendDelta(runKey.home, event.text);
+          else if (event.type === "action") appendAction(runKey.home, event.text);
+        },
+      )
+      .then((result) => {
+        const segments = result.segments?.length
+          ? toChatSegments(result.segments)
+          : snapshotRun(runKey.home);
+        const final: HomeChatMessage[] = [
+          ...next,
+          {
+            id: uid(),
+            role: "assistant",
+            content: result.content || "（无输出）",
+            segments,
+            proposals: result.proposals,
+            links: result.links,
+          },
+        ];
+        setMessages(final);
+        endRun(runKey.home);
+        persist(final);
+        // The agent may have read/affected ideas — keep the sidebar list fresh.
+        if (result.actions.length) {
+          queryClient.invalidateQueries({ queryKey: ["ideas"] });
+        }
+      })
+      .catch((error) => {
+        const final: HomeChatMessage[] = [
+          ...next,
+          { id: uid(), role: "assistant", content: `出错了：${String(error)}` },
+        ];
+        setMessages(final);
+        endRun(runKey.home);
+        persist(final);
+      });
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -166,7 +187,7 @@ export function HomeView({
     try {
       await api.deleteConversation(id);
       if (useWorkspaceStore.getState().homeConversationId === id) newConversation();
-      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      queryClient.invalidateQueries({ queryKey: ["conversations", "home"] });
     } catch {
       /* ignore */
     }
@@ -271,18 +292,23 @@ export function HomeView({
                 return (
                   <div className={`chat-message ${message.role}`} key={message.id}>
                     {message.role === "assistant" ? (
-                      <MarkdownPreview markdown={message.content} />
+                      message.segments?.length ? (
+                        <AgentSegments segments={message.segments} />
+                      ) : (
+                        <>
+                          <MarkdownPreview markdown={message.content} />
+                          {message.actions?.length ? (
+                            <ul className="chat-actions">
+                              {message.actions.map((action, index) => (
+                                <li key={index}>{action}</li>
+                              ))}
+                            </ul>
+                          ) : null}
+                        </>
+                      )
                     ) : (
                       <p>{message.content}</p>
                     )}
-
-                    {message.actions?.length ? (
-                      <ul className="chat-actions">
-                        {message.actions.map((action, index) => (
-                          <li key={index}>{action}</li>
-                        ))}
-                      </ul>
-                    ) : null}
 
                     {message.proposals?.map((proposal, index) => (
                       <IdeaPreviewCard
@@ -311,7 +337,11 @@ export function HomeView({
                   </div>
                 );
               })}
-              {agent.isPending ? <div className="chat-message assistant pending">执行中…</div> : null}
+              {run.running ? (
+                <div className="chat-message assistant pending">
+                  {run.segments.length ? <AgentSegments segments={run.segments} /> : "执行中…"}
+                </div>
+              ) : null}
             </div>
           )}
         </div>
@@ -329,7 +359,7 @@ export function HomeView({
           <button
             className="primary-button"
             onClick={() => send(input)}
-            disabled={agent.isPending || !apiKey || !input.trim()}
+            disabled={run.running || !apiKey || !input.trim()}
             title="发送"
           >
             <Send size={16} />

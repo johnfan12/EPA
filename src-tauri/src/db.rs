@@ -460,16 +460,30 @@ pub async fn search_workspace(
     .map_err(|err| err.to_string())
 }
 
+/// Lists conversations for a scope: `Some(idea_id)` → that idea's conversations;
+/// `None` → the global home-page conversations (idea_id IS NULL).
 #[tauri::command]
 pub async fn list_conversations(
     state: State<'_, AppState>,
+    idea_id: Option<i64>,
 ) -> Result<Vec<ConversationMeta>, String> {
-    sqlx::query_as::<_, ConversationMeta>(
-        "SELECT id, title, updated_at FROM conversations ORDER BY updated_at DESC, id DESC",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|err| err.to_string())
+    match idea_id {
+        Some(id) => sqlx::query_as::<_, ConversationMeta>(
+            "SELECT id, title, updated_at FROM conversations
+             WHERE idea_id = ? ORDER BY updated_at DESC, id DESC",
+        )
+        .bind(id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|err| err.to_string()),
+        None => sqlx::query_as::<_, ConversationMeta>(
+            "SELECT id, title, updated_at FROM conversations
+             WHERE idea_id IS NULL ORDER BY updated_at DESC, id DESC",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|err| err.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -508,9 +522,10 @@ pub async fn save_conversation(
                 .map_err(|err| err.to_string())?;
             id
         }
-        None => sqlx::query("INSERT INTO conversations(title, messages) VALUES (?, ?)")
+        None => sqlx::query("INSERT INTO conversations(title, messages, idea_id) VALUES (?, ?, ?)")
             .bind(&title)
             .bind(&messages)
+            .bind(payload.idea_id)
             .execute(&state.pool)
             .await
             .map_err(|err| err.to_string())?

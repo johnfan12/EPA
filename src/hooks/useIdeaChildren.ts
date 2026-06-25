@@ -1,17 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api";
 
-/** Loads the four record collections that belong to an idea (for the right rail). */
+/** Loads the record collections that belong to an idea (for the right rail). */
 export function useIdeaChildren(ideaId: number | null) {
   const enabled = ideaId != null;
   const entries = useQuery({
     queryKey: ["entries", ideaId],
     queryFn: () => api.listEntries(ideaId as number),
-    enabled,
-  });
-  const agentRuns = useQuery({
-    queryKey: ["agent-runs", ideaId],
-    queryFn: () => api.listAgentRuns(ideaId as number),
     enabled,
   });
   const experiments = useQuery({
@@ -27,7 +22,6 @@ export function useIdeaChildren(ideaId: number | null) {
 
   return {
     entries: entries.data ?? [],
-    agentRuns: agentRuns.data ?? [],
     experiments: experiments.data ?? [],
     reports: reports.data ?? [],
   };
